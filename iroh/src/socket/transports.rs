@@ -4,7 +4,7 @@ use std::{
     net::{IpAddr, Ipv6Addr, SocketAddr, SocketAddrV6},
     num::NonZeroUsize,
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, Mutex},
     task::{Context, Poll},
 };
 
@@ -36,7 +36,8 @@ pub(crate) use self::ip::Config as IpConfig;
 #[cfg(not(wasm_browser))]
 use self::ip::{IpNetworkChangeSender, IpTransports, IpTransportsSender};
 pub(crate) use self::relay::{
-    HomeRelayWatch, RelayActorConfig, RelayConnectionFailure, RelayConnectionState, RelayTransport,
+    HomeRelayWatch, RelayAbortHandles, RelayActorConfig, RelayConnectionFailure,
+    RelayConnectionState, RelayTransport,
 };
 
 /// How many times all transports may error on `poll_recv` before we give up.
@@ -372,6 +373,14 @@ impl Transports {
     /// for relay transports, this is the home relay.
     pub(crate) fn local_addrs(&self) -> Vec<Addr> {
         self.local_addrs_watch().get()
+    }
+
+    /// The shared abort handles of the relay actors (for force restarts).
+    pub(super) fn relay_abort_handles(&self) -> RelayAbortHandles {
+        self.relay
+            .first()
+            .map(|t| t.abort_handles.clone())
+            .unwrap_or_else(|| Arc::new(Mutex::new(std::collections::BTreeMap::new())))
     }
 
     pub(super) fn home_relay_watch(&self) -> HomeRelayWatcher {

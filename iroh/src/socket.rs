@@ -59,7 +59,7 @@ use url::Url;
 
 use self::{
     remote_map::{RemoteMap, RemoteStateMessage},
-    transports::{RelayActorConfig, Transports},
+    transports::{RelayAbortHandles, RelayActorConfig, Transports},
 };
 #[cfg(not(wasm_browser))]
 use crate::dns::DnsResolver;
@@ -366,6 +366,8 @@ pub(crate) struct Socket {
     #[cfg(not(wasm_browser))]
     dns_resolver: DnsResolver,
     relay_map: RelayMap,
+    /// Abort handles of the relay actors, for force restarting a relay connection.
+    relay_abort_handles: RelayAbortHandles,
 
     /// Optional Address Lookup
     address_lookup: address_lookup::AddressLookupServices,
@@ -981,6 +983,7 @@ impl EndpointInner {
         };
 
         let home_relay_watch = transports.home_relay_watch();
+        let relay_abort_handles = transports.relay_abort_handles();
 
         let sock = Arc::new(Socket {
             remote_actors: remote_map.senders(),
@@ -998,6 +1001,7 @@ impl EndpointInner {
             metrics: metrics.clone(),
             local_addrs_watch: transports.local_addrs_watch(),
             home_relay_watch,
+            relay_abort_handles,
             #[cfg(not(wasm_browser))]
             ip_bind_addrs: transports.ip_bind_addrs(),
             tls_config: tls_config.clone(),
@@ -1227,6 +1231,18 @@ impl EndpointInner {
 
         self.sock.shutdown.closed.store(true, Ordering::SeqCst);
         trace!("socket closed");
+    }
+
+    /// Tears down the connection to `url` so the next need for it dials anew.
+    pub(crate) fn force_restart_relay(&self, url: &RelayUrl) {
+        self.relay_abort_handles
+            .lock()
+            .expect("poisoned")
+            .remove(url)
+            .inspect(|handle| {
+                tracing::info!(%url, "forcing restart of the relay connection");
+                handle.abort();
+            });
     }
 
     pub(crate) async fn insert_relay(

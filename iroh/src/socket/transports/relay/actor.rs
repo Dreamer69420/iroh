@@ -34,6 +34,7 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
+        Mutex,
     },
 };
 
@@ -928,6 +929,8 @@ pub(super) struct RelayActor {
     active_relays: BTreeMap<RelayUrl, ActiveRelayHandle>,
     /// The tasks for the [`ActiveRelayActor`]s in `active_relays` above.
     active_relay_tasks: JoinSet<()>,
+    /// Abort handles for the tasks above, shared with the transport for force restarts.
+    abort_handles: RelayAbortHandles,
     cancel_token: CancellationToken,
 }
 
@@ -1059,6 +1062,13 @@ fn auth_denied_reason(error: &RelayConnectionError) -> Option<&str> {
 
 /// Shared watchable for the home relay URL and connection status.
 ///
+/// Shared map from relay URL to the abort handle of that URL's [`ActiveRelayActor`] task.
+///
+/// Owned by the [`RelayActor`] and shared with the [`RelayTransport`] so the connection to one
+/// relay server can be torn down and redialed from the outside (a force restart), even while the
+/// actor is not processing messages.
+pub(crate) type RelayAbortHandles = Arc<Mutex<BTreeMap<RelayUrl, tokio::task::AbortHandle>>>;
+
 /// Owned by [`RelayActor`] and cloned into each [`ActiveRelayActor`].
 ///
 /// # Write discipline
@@ -1117,14 +1127,17 @@ impl RelayActor {
         config: Config,
         relay_datagram_recv_queue: mpsc::Sender<RelayRecvDatagram>,
         cancel_token: CancellationToken,
-    ) -> Self {
-        Self {
+    ) -> (Self, RelayAbortHandles) {
+        let abort_handles: RelayAbortHandles = Arc::new(Mutex::new(BTreeMap::new()));
+        let actor = Self {
             config,
             relay_datagram_recv_queue,
             active_relays: Default::default(),
             active_relay_tasks: JoinSet::new(),
+            abort_handles: abort_handles.clone(),
             cancel_token,
-        }
+        };
+        (actor, abort_handles)
     }
 
     pub(super) async fn run(
@@ -1361,6 +1374,7 @@ impl RelayActor {
         let (prio_inbox_tx, prio_inbox_rx) = mpsc::channel(32);
         let (inbox_tx, inbox_rx) = mpsc::channel(64);
         let span = info_span!("active-relay", %url);
+        let abort_url = url.clone();
         let opts = ActiveRelayActorOptions {
             url,
             prio_inbox_: prio_inbox_rx,
@@ -1373,12 +1387,16 @@ impl RelayActor {
             my_relay: self.config.my_relay.clone(),
         };
         let actor = ActiveRelayActor::new(opts);
-        self.active_relay_tasks.spawn(
+        let task = self.active_relay_tasks.spawn(
             async move {
                 actor.run().await;
             }
             .instrument(span),
         );
+        self.abort_handles
+            .lock()
+            .expect("poisoned")
+            .insert(abort_url, task);
         let handle = ActiveRelayHandle {
             prio_inbox_addr: prio_inbox_tx,
             inbox_addr: inbox_tx,
@@ -1436,6 +1454,10 @@ impl RelayActor {
     fn reap_active_relays(&mut self) {
         self.active_relays
             .retain(|_url, handle| !handle.inbox_addr.is_closed());
+        self.abort_handles
+            .lock()
+            .expect("poisoned")
+            .retain(|url, _| self.active_relays.contains_key(url));
 
         // Make sure home relay exists
         if let Some(status) = self.config.my_relay.get() {
@@ -1549,7 +1571,7 @@ mod tests {
             metrics: Default::default(),
             relay_map: RelayMap::empty(),
         };
-        let mut actor =
+        let (mut actor, _abort_handles) =
             RelayActor::new(config, relay_datagram_recv_queue, CancellationToken::new());
 
         let handle = actor.active_relay_tasks.spawn(std::future::pending::<()>());

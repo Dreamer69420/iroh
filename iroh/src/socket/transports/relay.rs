@@ -22,7 +22,8 @@ use crate::endpoint::RelayStatus;
 mod actor;
 
 pub(crate) use self::actor::{
-    Config as RelayActorConfig, HomeRelayWatch, RelayConnectionFailure, RelayConnectionState,
+    Config as RelayActorConfig, HomeRelayWatch, RelayAbortHandles, RelayConnectionFailure,
+    RelayConnectionState,
 };
 use self::actor::{RelayActor, RelayActorMessage, RelayRecvDatagram, RelaySendItem};
 
@@ -39,6 +40,8 @@ pub(crate) struct RelayTransport {
     pending_item: Option<RelayRecvDatagram>,
     actor_sender: mpsc::Sender<RelayActorMessage>,
     _actor_handle: AbortOnDropHandle<()>,
+    /// Abort handles of the active relay actors, so a connection can be force restarted.
+    pub(crate) abort_handles: RelayAbortHandles,
     my_relay: HomeRelayWatch,
     my_endpoint_id: EndpointId,
 }
@@ -60,7 +63,8 @@ impl RelayTransport {
         let my_endpoint_id = config.secret_key.public();
         let my_relay = config.my_relay.clone();
 
-        let relay_actor = RelayActor::new(config, relay_datagram_recv_tx, cancel_token);
+        let (relay_actor, abort_handles) =
+            RelayActor::new(config, relay_datagram_recv_tx, cancel_token);
 
         let actor_handle = AbortOnDropHandle::new(task::spawn(
             async move {
@@ -77,6 +81,7 @@ impl RelayTransport {
             pending_item: None,
             actor_sender,
             _actor_handle: actor_handle,
+            abort_handles,
             my_relay,
             my_endpoint_id,
         }

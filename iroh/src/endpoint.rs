@@ -1008,6 +1008,19 @@ impl Endpoint {
         self.inner.insert_relay(relay, config).await
     }
 
+    /// Tears down the current connection to the relay server at `url`, if one exists, so
+    /// the next need for that relay dials it anew.
+    ///
+    /// This is the recovery lever for a relay connection that has stopped making progress:
+    /// an engine that must reach its peers through the relay can call this when the relay
+    /// stays unreachable for longer than its own retry budget, instead of staying offline
+    /// until the process is restarted. A relay that is healthy is not disturbed; a relay
+    /// that is not configured is ignored. The actor behind the connection is aborted even
+    /// when it is no longer processing messages, which also unblocks anything waiting on it.
+    pub fn restart_relay(&self, url: &RelayUrl) {
+        self.inner.force_restart_relay(url);
+    }
+
     /// Removes the configuration from the [`RelayMap`] for the provided [`RelayUrl`].
     ///
     /// Returns any existing configuration if it exists. Will also return `None` if the endpoint is closed.
