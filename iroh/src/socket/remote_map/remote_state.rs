@@ -1628,4 +1628,64 @@ mod tests {
             }
         }
     }
+
+    /// An IP path, for a queue that holds several addresses.
+    fn ip_path(last_octet: u8, port: u16) -> transports::FourTuple {
+        transports::FourTuple::from_remote(transports::Addr::Ip(SocketAddr::from((
+            [192, 0, 2, last_octet],
+            port,
+        ))))
+    }
+
+    /// The retry queue holds each address that keeps failing once, however many times its open
+    /// fails and however many connections it fails on.
+    ///
+    /// The shape is the round's: the queued addresses are drained and attempted, and every open
+    /// the remote cannot satisfy queues its address again. Fix-20's first cut removed the repeats
+    /// as the round pulled them off the queue, so the queue still took one entry per failure and
+    /// grew without bound between rounds (the round is put 333 ms off by every failure, and
+    /// `apply_selected_path` and a new connection both queue addresses between rounds, so a fast
+    /// enough stream of failures leaves the round never running). Run against the rule in
+    /// [`queue_open_path`] instead, the queue sits at one entry per address and the rounds never
+    /// end.
+    #[test]
+    fn a_retry_round_never_grows_the_queue_past_one_entry_per_address() {
+        const ADDRESSES: usize = 4;
+        const FAILING_CONNECTIONS: usize = 3;
+        const ROUNDS: usize = 40;
+
+        let addresses: Vec<_> = (0..ADDRESSES)
+            .map(|i| ip_path(1 + i as u8, 41_000 + i as u16))
+            .collect();
+        let mut queue: VecDeque<_> = addresses.iter().cloned().collect();
+
+        for round in 0..ROUNDS {
+            // One address attempted on each connection is how many opens fail; each failure
+            // writes its address back through the enqueue rule.
+            let mut due = std::mem::take(&mut queue);
+            let mut failures = 0;
+            while let Some(addr) = due.pop_front() {
+                for _ in 0..FAILING_CONNECTIONS {
+                    failures += 1;
+                    queue_open_path(&mut queue, &addr);
+                }
+            }
+            assert_eq!(
+                failures,
+                ADDRESSES * FAILING_CONNECTIONS,
+                "round {round} did not run {FAILING_CONNECTIONS} failing opens per address"
+            );
+            assert_eq!(
+                queue.len(),
+                ADDRESSES,
+                "round {round} left {} entries in the queue for {ADDRESSES} failing addresses",
+                queue.len()
+            );
+            assert_eq!(
+                Vec::from_iter(queue.iter().cloned()),
+                addresses,
+                "round {round} did not hold the addresses in the order they were queued"
+            );
+        }
+    }
 }
