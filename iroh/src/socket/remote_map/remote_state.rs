@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashSet, VecDeque},
+    collections::{BTreeSet, VecDeque},
     net::SocketAddr,
     pin::Pin,
     sync::Arc,
@@ -304,8 +304,8 @@ impl RemoteStateActor {
                 _ = &mut scheduled_path_open => {
                     trace!("triggering scheduled path_open");
                     self.state.scheduled_open_path = None;
-                    let addrs = due_open_paths(std::mem::take(&mut self.state.pending_open_paths));
-                    for addr in addrs {
+                    let mut addrs = std::mem::take(&mut self.state.pending_open_paths);
+                    while let Some(addr) = addrs.pop_front() {
                         self.open_path_on_all_conns(&addr);
                     }
                 }
@@ -1080,7 +1080,7 @@ impl State {
                     | Some(Err(PathError::MaxPathIdReached)) => {
                         self.scheduled_open_path =
                             Some(Instant::now() + Duration::from_millis(333));
-                        self.pending_open_paths.push_back(open_4tuple.clone());
+                        queue_open_path(&mut self.pending_open_paths, open_4tuple);
                         trace!(?open_4tuple, ?ret, "scheduling open_path");
                     }
                     _ => warn!(?ret, "Opening path failed"),
@@ -1562,26 +1562,21 @@ async fn maybe_next<S: Stream + Unpin>(maybe_stream: Option<&mut S>) -> Option<O
     }
 }
 
-/// The addresses one scheduled path-open round is due to attempt: every queued address once,
-/// in the order it was queued.
+/// Queue `addr` for the next retry round, unless the queue already holds it.
 ///
-/// An attempt the remote cannot satisfy yet goes back on `pending_open_paths` once *per
-/// connection* that failed it (see [`State::open_path_on_conn`]), so a queue of repeats keeps
-/// that shape. Draining it as-is would attempt every repeat, and each round re-creates that many
-/// repeats, so the queue multiplies by the number of failing connections every round until the
-/// node runs out of memory while the retry loop does no more work than it did in the first round.
-///
-/// Attempting an address once per round loses nothing: [`RemoteStateActor::open_path_on_all_conns`]
-/// loops over all connections anyway, so each connection still gets its attempt at the next round.
-fn due_open_paths(queued: VecDeque<transports::FourTuple>) -> Vec<transports::FourTuple> {
-    let mut seen = HashSet::with_capacity(queued.len());
-    let mut due = Vec::with_capacity(queued.len());
-    for addr in queued {
-        if seen.insert(addr.clone()) {
-            due.push(addr);
-        }
+/// An attempt the remote cannot satisfy yet is queued again, and the round is put off 333 ms.
+/// Unbounded, that makes the queue grow with the failures rather than with the addresses: every
+/// path event and every new connection pushes one entry per failing open, and each of those
+/// pushes also moves the round's deadline out, so a stream of failures faster than three a second
+/// leaves the round never running and the queue growing. Keeping one entry per address bounds the
+/// queue by the set of candidate addresses for the remote, which is small, so the check is a short
+/// scan. It is upstream's fix for this: n0-computer/iroh#4390, closed by PR #4551, merged on main
+/// as `43e232fb` and in no release yet. That change is the one line inside this function; it is a
+/// function so the rule it makes can be tested (FIX-20 code review 1, CR-3).
+fn queue_open_path(queued: &mut VecDeque<transports::FourTuple>, addr: &transports::FourTuple) {
+    if !queued.contains(addr) {
+        queued.push_back(addr.clone());
     }
-    due
 }
 
 #[cfg(all(test, not(wasm_browser)))]
@@ -1632,73 +1627,5 @@ mod tests {
                 assert_eq!(&buf[..len], b"initial");
             }
         }
-    }
-
-    /// An IP path, for a round that has several addresses to retry.
-    fn ip_path(last_octet: u8, port: u16) -> transports::FourTuple {
-        transports::FourTuple::from_remote(transports::Addr::Ip(SocketAddr::from((
-            [192, 0, 2, last_octet],
-            port,
-        ))))
-    }
-
-    /// The queue the path-open retry keeps must stay bounded.
-    ///
-    /// Every attempt that the remote cannot satisfy yet is queued again, once per failing
-    /// connection, so a queue drained as-is multiplies by that many connections every 333 ms
-    /// round: a handful of addresses and connections becomes hundreds of thousands of queued
-    /// entries in a few minutes and the node dies on its next allocation. This is the shape of
-    /// the runaway FIX-20 measured on a Mac, where the retry loop was the hot thread while the
-    /// resident set grew by the minute.
-    #[test]
-    fn retry_queue_stays_bounded_by_addresses_and_connections() {
-        const ADDRESSES: usize = 4;
-        const FAILING_CONNECTIONS: usize = 3;
-        const ROUNDS: usize = 40;
-
-        let paths: Vec<_> = (0..ADDRESSES)
-            .map(|i| ip_path(1 + i as u8, 41_000 + i as u16))
-            .collect();
-
-        // One queue entry per address, which is how they enter the queue in the first place.
-        let mut pending: VecDeque<_> = paths.iter().cloned().collect();
-        let mut longest = 0;
-
-        for round in 0..ROUNDS {
-            let due = due_open_paths(std::mem::take(&mut pending));
-
-            let distinct = due.iter().collect::<HashSet<_>>().len();
-            assert_eq!(
-                distinct,
-                due.len(),
-                "round {round} attempted the same address more than once: {due:?}"
-            );
-            assert!(
-                due.len() <= ADDRESSES,
-                "round {round} attempted {} paths for {ADDRESSES} known addresses",
-                due.len()
-            );
-
-            // Each attempt is one open per connection, and every one of them fails synchronously,
-            // which is what puts the address back on the queue.
-            for path in &due {
-                for _ in 0..FAILING_CONNECTIONS {
-                    pending.push_back(path.clone());
-                }
-            }
-            longest = longest.max(pending.len());
-            assert!(
-                pending.len() <= ADDRESSES * FAILING_CONNECTIONS,
-                "round {round} queued {} path opens for {ADDRESSES} addresses and \
-                 {FAILING_CONNECTIONS} connections",
-                pending.len()
-            );
-        }
-        assert_eq!(
-            longest,
-            ADDRESSES * FAILING_CONNECTIONS,
-            "the queue never reached the size a full round of failures makes, so the round was \
-             not running as written"
-        );
     }
 }
