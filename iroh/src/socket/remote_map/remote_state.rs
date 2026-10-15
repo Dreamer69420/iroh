@@ -1080,7 +1080,7 @@ impl State {
                     | Some(Err(PathError::MaxPathIdReached)) => {
                         self.scheduled_open_path =
                             Some(Instant::now() + Duration::from_millis(333));
-                        self.pending_open_paths.push_back(open_4tuple.clone());
+                        queue_open_path(&mut self.pending_open_paths, open_4tuple);
                         trace!(?open_4tuple, ?ret, "scheduling open_path");
                     }
                     _ => warn!(?ret, "Opening path failed"),
@@ -1559,6 +1559,23 @@ async fn maybe_next<S: Stream + Unpin>(maybe_stream: Option<&mut S>) -> Option<O
     match maybe_stream {
         None => None,
         Some(s) => Some(s.next().await),
+    }
+}
+
+/// Queue `addr` for the next retry round, unless the queue already holds it.
+///
+/// An attempt the remote cannot satisfy yet is queued again, and the round is put off 333 ms.
+/// Unbounded, that makes the queue grow with the failures rather than with the addresses: every
+/// path event and every new connection pushes one entry per failing open, and each of those
+/// pushes also moves the round's deadline out, so a stream of failures faster than three a second
+/// leaves the round never running and the queue growing. Keeping one entry per address bounds the
+/// queue by the set of candidate addresses for the remote, which is small, so the check is a short
+/// scan. It is upstream's fix for this: n0-computer/iroh#4390, closed by PR #4551, merged on main
+/// as `43e232fb` and in no release yet. That change is the one line inside this function; it is a
+/// function so the rule it makes can be tested (FIX-20 code review 1, CR-3).
+fn queue_open_path(queued: &mut VecDeque<transports::FourTuple>, addr: &transports::FourTuple) {
+    if !queued.contains(addr) {
+        queued.push_back(addr.clone());
     }
 }
 
